@@ -187,8 +187,7 @@ func TestRecalcWorkbookWithoutFormulas(t *testing.T) {
 
 func TestRecalcAggregatesFailures(t *testing.T) {
 	// An unsupported function on one cell must not prevent other cells
-	// from being recalculated. The returned error is the join of
-	// per-cell failures, each wrapped as "sheet!cell: <cause>".
+	// from being recalculated.
 	f := NewFile()
 	assert.NoError(t, f.SetCellFormula("Sheet1", "A1", "NONEXISTENTFUNC(1)"))
 	assert.NoError(t, f.SetCellInt("Sheet1", "B1", 10))
@@ -196,11 +195,11 @@ func TestRecalcAggregatesFailures(t *testing.T) {
 
 	err := f.Recalc()
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Sheet1!A1:")
-	// Joined error exposes causes via Unwrap() []error.
-	unwrapped, ok := err.(interface{ Unwrap() []error })
-	if assert.True(t, ok, "expected errors.Join result") {
-		assert.Len(t, unwrapped.Unwrap(), 1)
+	rerr, ok := err.(*RecalcError)
+	if assert.True(t, ok, "expected *RecalcError, got %T", err) {
+		assert.Len(t, rerr.Cells, 1)
+		assert.Equal(t, "Sheet1", rerr.Cells[0].Sheet)
+		assert.Equal(t, "A1", rerr.Cells[0].Cell)
 	}
 	// Working cell was still recalculated.
 	assert.Equal(t, "20", cellXML(t, f, "Sheet1", "B2").V)

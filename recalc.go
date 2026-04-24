@@ -12,7 +12,6 @@
 package excelize
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 )
@@ -25,6 +24,54 @@ type RecalcOptions struct {
 	// Ref limits recalc to cells inside the given A1-style range
 	// (e.g. B2:D10). Requires Sheet to be set.
 	Ref string
+}
+
+// RecalcError aggregates the per-cell failures encountered by Recalc.
+// Use errors.As to extract it from the value returned by Recalc. The
+// individual cell errors are exposed via Unwrap so errors.Is and errors.As can
+// descend into them.
+type RecalcError struct {
+	// Cells lists each formula that could not be evaluated, in the order Recalc
+	// encountered them.
+	Cells []RecalcCellError
+}
+
+// RecalcCellError describes a single formula cell that could not be evaluated
+// during Recalc.
+type RecalcCellError struct {
+	Sheet string
+	Cell  string
+	Err   error
+}
+
+// Error formats this single cell failure as "sheet!cell: err".
+func (e RecalcCellError) Error() string {
+	return fmt.Sprintf("%s!%s: %v", e.Sheet, e.Cell, e.Err)
+}
+
+// Unwrap returns the wrapped cause.
+func (e RecalcCellError) Unwrap() error { return e.Err }
+
+// Error returns a human-readable summary listing the first failing cell and the
+// total count.
+func (e *RecalcError) Error() string {
+	if len(e.Cells) == 0 {
+		return "recalc: unknown error"
+	}
+	first := e.Cells[0]
+	if len(e.Cells) == 1 {
+		return fmt.Sprintf("recalc: %s", first.Error())
+	}
+	return fmt.Sprintf("recalc: %s (and %d more)", first.Error(), len(e.Cells)-1)
+}
+
+// Unwrap exposes the underlying per-cell errors.
+func (e *RecalcError) Unwrap() []error {
+	out := make([]error, len(e.Cells))
+	for i := range e.Cells {
+		out[i] = e.Cells[i]
+	}
+	return out
 }
 
 // Recalc evaluates every formula in scope and persists each result
@@ -47,10 +94,8 @@ type RecalcOptions struct {
 // MaxCalcIterations option, matching existing calc engine behaviour.
 //
 // When any formula cannot be evaluated, Recalc continues with the
-// remaining cells. Each failure is wrapped as
-// fmt.Errorf("<sheet>!<cell>: %w", err); Recalc returns the joined
-// collection via errors.Join so errors.Is / errors.As descend into
-// the underlying causes. Cells that did compute are still persisted.
+// remaining cells and returns a *RecalcError listing every failure.
+// Cells that did compute are still persisted.
 func (f *File) Recalc(opts ...RecalcOptions) error {
 	var o RecalcOptions
 	if len(opts) > 0 {
@@ -61,14 +106,17 @@ func (f *File) Recalc(opts ...RecalcOptions) error {
 		return err
 	}
 	f.clearCalcCache()
-	var failures []error
+	var failures []RecalcCellError
 	for _, t := range cells {
 		if err := f.RecalcCell(t.sheet, t.cell); err != nil {
-			failures = append(failures, fmt.Errorf("%s!%s: %w", t.sheet, t.cell, err))
+			failures = append(failures, RecalcCellError{Sheet: t.sheet, Cell: t.cell, Err: err})
 		}
 	}
 	f.clearCalcCache()
-	return errors.Join(failures...)
+	if len(failures) > 0 {
+		return &RecalcError{Cells: failures}
+	}
+	return nil
 }
 
 // recalcTarget identifies a formula cell scheduled for recalculation.
