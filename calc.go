@@ -954,7 +954,7 @@ func (f *File) calcCellValue(ctx *calcContext, sheet, cell string) (result formu
 		return
 	}
 	ps := efp.ExcelParser()
-	tokens := ps.Parse(formula)
+	tokens := ps.Parse(f.expandFormulaText(sheet, cell, formula))
 	if tokens == nil {
 		return f.cellResolver(ctx, sheet, cell)
 	}
