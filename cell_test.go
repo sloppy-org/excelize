@@ -1332,3 +1332,28 @@ func TestGetCellStringFunc(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NoError(t, f.Close())
 }
+
+func TestSetCellFormulaLeavesResultUntyped(t *testing.T) {
+	// A formula written without a cached result must not be typed as text, and
+	// a value previously stored in the cell must not survive as its result.
+	f := NewFile()
+	assert.NoError(t, f.SetCellValue("Sheet1", "A1", 5))
+	assert.NoError(t, f.SetCellFormula("Sheet1", "A1", "1+2"))
+	assert.NoError(t, f.SetCellFormula("Sheet1", "B1", "A1*2"))
+	ws, err := f.workSheetReader("Sheet1")
+	assert.NoError(t, err)
+	for _, cell := range []string{"A1", "B1"} {
+		c, _, _, err := ws.prepareCell(cell)
+		assert.NoError(t, err)
+		assert.Empty(t, c.T, cell)
+		assert.Empty(t, c.V, cell)
+	}
+	assert.NoError(t, f.Recalc())
+	cellType, err := f.GetCellType("Sheet1", "B1")
+	assert.NoError(t, err)
+	assert.Equal(t, CellTypeUnset, cellType)
+	value, err := f.GetCellValue("Sheet1", "B1")
+	assert.NoError(t, err)
+	assert.Equal(t, "6", value)
+	assert.NoError(t, f.Close())
+}

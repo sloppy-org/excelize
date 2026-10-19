@@ -882,7 +882,9 @@ func (f *File) SetCellFormula(sheet, cell, formula string, opts ...FormulaOpts) 
 			c.F.Ref = *opt.Ref
 		}
 	}
-	c.T, c.IS = "str", nil
+	// A new formula has no cached result yet: drop the old value and leave the
+	// cell type unset, so a later numeric result is not read back as text.
+	c.T, c.V, c.IS = "", "", nil
 	return err
 }
 
