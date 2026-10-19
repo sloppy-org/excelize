@@ -341,6 +341,8 @@ func (fa formulaArg) ToNumber() formulaArg {
 		}
 	case ArgNumber:
 		n = fa.Number
+	case ArgError:
+		return fa
 	case ArgMatrix:
 		if args := fa.ToList(); len(args) > 0 {
 			return args[0].ToNumber()
@@ -1037,6 +1039,10 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 		formulaArrayRow                 []formulaArg
 		opdStack, optStack, opfStack    = NewStack(), NewStack(), NewStack()
 		opfdStack, opftStack, argsStack = NewStack(), NewStack(), NewStack()
+		// opfdBase records the opfdStack depth at each function start, so
+		// operands pushed before the function (e.g. the "2" in 1+2*SUM(A1)
+		// nested in another function) are never taken as its arguments.
+		opfdBase = NewStack()
 	)
 	for i := 0; i < len(tokens); i++ {
 		token := tokens[i]
@@ -1060,6 +1066,7 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 			}
 			opfStack.Push(token)
 			argsStack.Push(list.New().Init())
+			opfdBase.Push(opfdStack.Len())
 			opftStack.Push(token) // to know which operators belong to a function use the function as a separator
 			continue
 		}
@@ -1122,7 +1129,7 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 					}
 					opftStack.Pop()
 				}
-				if !opfdStack.Empty() {
+				if opfdStack.Len() > opfdBase.Peek().(int) {
 					argsStack.Peek().(*list.List).PushBack(opfdStack.Pop().(formulaArg))
 				}
 				continue
@@ -1142,7 +1149,7 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 				inArray = false
 				continue
 			}
-			if errArg := f.evalInfixExpFunc(ctx, sheet, cell, token, nextToken, opfStack, opdStack, opftStack, opfdStack, argsStack); errArg.Type == ArgError {
+			if errArg := f.evalInfixExpFunc(ctx, sheet, cell, token, nextToken, opfStack, opdStack, opftStack, opfdStack, opfdBase, argsStack); errArg.Type == ArgError {
 				return errArg, errors.New(errArg.Error)
 			}
 		}
@@ -1164,11 +1171,11 @@ func (f *File) evalInfixExp(ctx *calcContext, sheet, cell string, tokens []efp.T
 }
 
 // evalInfixExpFunc evaluate formula function in the infix expression.
-func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nextToken efp.Token, opfStack, opdStack, opftStack, opfdStack, argsStack *Stack) formulaArg {
+func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nextToken efp.Token, opfStack, opdStack, opftStack, opfdStack, opfdBase, argsStack *Stack) formulaArg {
 	if !isFunctionStopToken(token) {
 		return newEmptyFormulaArg()
 	}
-	prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack)
+	prepareEvalInfixExp(opfStack, opftStack, opfdStack, opfdBase, argsStack)
 	// call formula function to evaluate
 	arg := callFuncByName(&formulaFuncs{f: f, sheet: sheet, cell: cell, ctx: ctx},
 		formulaFnNameReplacer.Replace(opfStack.Peek().(efp.Token).TValue),
@@ -1177,6 +1184,7 @@ func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nex
 		return arg
 	}
 	argsStack.Pop()
+	opfdBase.Pop()
 	opftStack.Pop() // remove current function separator
 	opfStack.Pop()
 	if opfStack.Len() > 0 { // still in function stack
@@ -1198,7 +1206,7 @@ func (f *File) evalInfixExpFunc(ctx *calcContext, sheet, cell string, token, nex
 
 // prepareEvalInfixExp check the token and stack state for formula function
 // evaluate.
-func prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack *Stack) {
+func prepareEvalInfixExp(opfStack, opftStack, opfdStack, opfdBase, argsStack *Stack) {
 	// current token is function stop
 	for opftStack.Peek().(efp.Token) != opfStack.Peek().(efp.Token) {
 		// calculate trigger
@@ -1210,29 +1218,8 @@ func prepareEvalInfixExp(opfStack, opftStack, opfdStack, argsStack *Stack) {
 		}
 		opftStack.Pop()
 	}
-	argument := true
-	if opftStack.Len() > 2 && opfdStack.Len() == 1 {
-		topOpt := opftStack.Pop()
-		// Look past any subexpression start, function start, and prefix operator tokens
-		var savedTokens []efp.Token
-		for opftStack.Len() > 0 {
-			token := opftStack.Peek().(efp.Token)
-			if !isBeginParenthesesToken(token) && !isFunctionStartToken(token) && token.TType != efp.TokenTypeOperatorPrefix {
-				break
-			}
-			savedTokens = append(savedTokens, opftStack.Pop().(efp.Token))
-		}
-		if opftStack.Len() > 0 && opftStack.Peek().(efp.Token).TType == efp.TokenTypeOperatorInfix {
-			argument = false
-		}
-		// Restore saved tokens
-		for i := len(savedTokens) - 1; i >= 0; i-- {
-			opftStack.Push(savedTokens[i])
-		}
-		opftStack.Push(topOpt)
-	}
-	// push opfd to args
-	if argument && opfdStack.Len() > 0 {
+	// push opfd to args, but only operands produced inside this function
+	if opfdStack.Len() > opfdBase.Peek().(int) {
 		argsStack.Peek().(*list.List).PushBack(opfdStack.Pop().(formulaArg))
 	}
 }
@@ -2061,6 +2048,29 @@ func formulaCriteriaEval(val formulaArg, criteria *formulaCriteria) (result bool
 		return regexp.MatchString(pattern, val.Value())
 	}
 	return
+}
+
+// formulaIfCriteriaParser parses the criteria of the conditional aggregate
+// functions (SUMIF, COUNTIF, AVERAGEIF and the *IFS family). An empty
+// criteria matches blank cells, as in Excel.
+func formulaIfCriteriaParser(exp formulaArg) *formulaCriteria {
+	if exp.Value() == "" {
+		return &formulaCriteria{Type: criteriaEq, Condition: newStringFormulaArg("")}
+	}
+	return formulaCriteriaParser(exp)
+}
+
+// formulaIfCriteriaEval evaluates a conditional aggregate criteria against a
+// cell. A blank cell matches only "" or "=" (equal to blank) and "<>value"
+// with a non-empty value, as in Excel; "<>" alone means non-blank.
+func formulaIfCriteriaEval(val formulaArg, criteria *formulaCriteria) bool {
+	if val.Value() == "" {
+		cond := criteria.Condition.Value()
+		return (criteria.Type == criteriaEq && cond == "") ||
+			(criteria.Type == criteriaNe && cond != "")
+	}
+	ok, _ := formulaCriteriaEval(val, criteria)
+	return ok
 }
 
 // Engineering Functions
@@ -6136,7 +6146,7 @@ func (fn *formulaFuncs) SUMIF(argsList *list.List) formulaArg {
 	if argsList.Len() < 2 {
 		return newErrorFormulaArg(formulaErrorVALUE, "SUMIF requires at least 2 arguments")
 	}
-	criteria := formulaCriteriaParser(argsList.Front().Next().Value.(formulaArg))
+	criteria := formulaIfCriteriaParser(argsList.Front().Next().Value.(formulaArg))
 	rangeMtx := argsList.Front().Value.(formulaArg).Matrix
 	var sumRange [][]formulaArg
 	if argsList.Len() == 3 {
@@ -6147,10 +6157,7 @@ func (fn *formulaFuncs) SUMIF(argsList *list.List) formulaArg {
 	for rowIdx, row := range rangeMtx {
 		for colIdx, cell := range row {
 			arg = cell
-			if arg.Type == ArgEmpty {
-				continue
-			}
-			if ok, _ := formulaCriteriaEval(arg, criteria); ok {
+			if formulaIfCriteriaEval(arg, criteria) {
 				if argsList.Len() == 3 {
 					if len(sumRange) > rowIdx && len(sumRange[rowIdx]) > colIdx {
 						arg = sumRange[rowIdx][colIdx]
@@ -6484,7 +6491,7 @@ func (fn *formulaFuncs) AVERAGEIF(argsList *list.List) formulaArg {
 		return newErrorFormulaArg(formulaErrorVALUE, "AVERAGEIF requires at least 2 arguments")
 	}
 	var (
-		criteria  = formulaCriteriaParser(argsList.Front().Next().Value.(formulaArg))
+		criteria  = formulaIfCriteriaParser(argsList.Front().Next().Value.(formulaArg))
 		rangeMtx  = argsList.Front().Value.(formulaArg).Matrix
 		cellRange [][]formulaArg
 		args      []formulaArg
@@ -6498,13 +6505,10 @@ func (fn *formulaFuncs) AVERAGEIF(argsList *list.List) formulaArg {
 	for rowIdx, row := range rangeMtx {
 		for colIdx, col := range row {
 			fromVal := col.Value()
-			if fromVal == "" {
+			if fromVal != "" && col.Type == ArgString && criteria.Condition.Type != ArgString {
 				continue
 			}
-			if col.Type == ArgString && criteria.Condition.Type != ArgString {
-				continue
-			}
-			ok, _ = formulaCriteriaEval(col, criteria)
+			ok = formulaIfCriteriaEval(col, criteria)
 			if ok {
 				if argsList.Len() == 3 {
 					if len(cellRange) > rowIdx && len(cellRange[rowIdx]) > colIdx {
@@ -8198,14 +8202,14 @@ func (fn *formulaFuncs) COUNTIF(argsList *list.List) formulaArg {
 		return newErrorFormulaArg(formulaErrorVALUE, "COUNTIF requires 2 arguments")
 	}
 	var (
-		criteria = formulaCriteriaParser(argsList.Front().Next().Value.(formulaArg))
+		criteria = formulaIfCriteriaParser(argsList.Front().Next().Value.(formulaArg))
 		count    float64
 	)
 	for _, cell := range argsList.Front().Value.(formulaArg).ToList() {
-		if cell.Type == ArgString && criteria.Condition.Type != ArgString {
+		if cell.Value() != "" && cell.Type == ArgString && criteria.Condition.Type != ArgString {
 			continue
 		}
-		if ok, _ := formulaCriteriaEval(cell, criteria); ok {
+		if formulaIfCriteriaEval(cell, criteria) {
 			count++
 		}
 	}
@@ -8216,11 +8220,11 @@ func (fn *formulaFuncs) COUNTIF(argsList *list.List) formulaArg {
 func formulaIfsMatch(args []formulaArg) (cellRefs []cellRef) {
 	for i := 0; i < len(args)-1; i += 2 {
 		var match []cellRef
-		matrix, criteria := args[i].Matrix, formulaCriteriaParser(args[i+1])
+		matrix, criteria := args[i].Matrix, formulaIfCriteriaParser(args[i+1])
 		if i == 0 {
 			for rowIdx, row := range matrix {
 				for colIdx, col := range row {
-					if ok, _ := formulaCriteriaEval(col, criteria); ok {
+					if formulaIfCriteriaEval(col, criteria) {
 						match = append(match, cellRef{Col: colIdx, Row: rowIdx})
 					}
 				}
@@ -8229,7 +8233,7 @@ func formulaIfsMatch(args []formulaArg) (cellRefs []cellRef) {
 			match = []cellRef{}
 			for _, ref := range cellRefs {
 				value := matrix[ref.Row][ref.Col]
-				if ok, _ := formulaCriteriaEval(value, criteria); ok {
+				if formulaIfCriteriaEval(value, criteria) {
 					match = append(match, ref)
 				}
 			}

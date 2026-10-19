@@ -7264,3 +7264,86 @@ func TestCalc3DRef(t *testing.T) {
 	assert.Empty(t, split3DReference(":Sheet1!A1"))
 	assert.Empty(t, split3DReference("!A1"))
 }
+
+func TestCalcNestedFunctionOperands(t *testing.T) {
+	// A function nested behind pending infix operators inside another
+	// function must not take the outer operands as its own arguments.
+	f := NewFile()
+	defer func() {
+		assert.NoError(t, f.Close())
+	}()
+	_, err := f.NewSheet("2027")
+	assert.NoError(t, err)
+	_, err = f.NewSheet("Cost inputs")
+	assert.NoError(t, err)
+	assert.NoError(t, f.SetCellValue("Sheet1", "A1", 2))
+	assert.NoError(t, f.SetCellValue("2027", "B1", 3))
+	assert.NoError(t, f.SetCellValue("Cost inputs", "B1", 0.5))
+	assert.NoError(t, f.SetCellValue("Cost inputs", "B2", 0.25))
+	for formula, expected := range map[string]string{
+		"ABS(1+A1*SUM('2027'!B1))":    "7",
+		"ABS(1+2*SUM('2027'!B1))":     "7",
+		"ABS(1+A1*SUM(B9))":           "1",
+		"ABS(1+A1*MAX('2027'!B1:B2))": "7",
+		"ROUND(A1*SUM('Cost inputs'!B1:B2)*MIN(1,2)+A1*SUM('Cost inputs'!B1),2)": "2.5",
+		"SUM(1+A1*SUM('2027'!B1),10)":                                            "17",
+		"MAX(A1*MIN('2027'!B1,4),1)":                                             "6",
+	} {
+		assert.NoError(t, f.SetCellFormula("Sheet1", "C1", formula))
+		result, err := f.CalcCellValue("Sheet1", "C1")
+		assert.NoError(t, err, formula)
+		assert.Equal(t, expected, result, formula)
+	}
+}
+
+func TestCalcConditionalBlankCriteria(t *testing.T) {
+	// An empty criteria matches blank cells, "<>" matches non-blank cells and
+	// "<>value" also matches blank cells, as in Excel and LibreOffice.
+	f := NewFile()
+	defer func() {
+		assert.NoError(t, f.Close())
+	}()
+	for cell, value := range map[string]interface{}{
+		"A1": "x", "A2": "x", "B1": 1, "B2": 2, "B3": 4, "B4": 8,
+	} {
+		assert.NoError(t, f.SetCellValue("Sheet1", cell, value))
+	}
+	for formula, expected := range map[string]string{
+		`SUMIF(A1:A4,"",B1:B4)`:         "12",
+		`SUMIF(A1:A4,"=",B1:B4)`:        "12",
+		`SUMIF(A1:A4,"<>",B1:B4)`:       "3",
+		`SUMIF(A1:A4,"<>x",B1:B4)`:      "12",
+		`SUMIFS(B1:B4,A1:A4,"")`:        "12",
+		`COUNTIF(A1:A4,"")`:             "2",
+		`COUNTIF(A1:A4,"<>")`:           "2",
+		`COUNTIFS(A1:A4,"",B1:B4,">2")`: "2",
+		`AVERAGEIF(A1:A4,"",B1:B4)`:     "6",
+		`COUNTIF(B1:B5,"<1")`:           "0",
+		`COUNTIF(B1:B5,"<>1")`:          "4",
+	} {
+		assert.NoError(t, f.SetCellFormula("Sheet1", "C1", formula))
+		result, err := f.CalcCellValue("Sheet1", "C1")
+		assert.NoError(t, err, formula)
+		assert.Equal(t, expected, result, formula)
+	}
+}
+
+func TestCalcErrorOperandsPropagate(t *testing.T) {
+	// Numeric functions must propagate an error argument instead of reading
+	// it as zero.
+	f := NewFile()
+	defer func() {
+		assert.NoError(t, f.Close())
+	}()
+	for formula, expected := range map[string]string{
+		"ABS(1/0)":               "#DIV/0!",
+		"ROUND(1/0,2)":           "#DIV/0!",
+		"ABS(1+2*NA())":          "#N/A",
+		"IFERROR(ABS(1/0),5)":    "5",
+		"ISERROR(ROUND(NA(),0))": "TRUE",
+	} {
+		assert.NoError(t, f.SetCellFormula("Sheet1", "C1", formula))
+		result, _ := f.CalcCellValue("Sheet1", "C1")
+		assert.Equal(t, expected, result, formula)
+	}
+}
